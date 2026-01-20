@@ -1,600 +1,609 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
 import plotly.graph_objects as go
 
-from statsmodels.tsa.seasonal import STL, seasonal_decompose
-from statsmodels.tsa.stattools import adfuller, kpss
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.seasonal import STL
+from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.stats.diagnostic import acorr_ljungbox
-from statsmodels.graphics.gofplots import qqplot
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
-from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
-from scipy.stats import norm
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 import warnings
 warnings.filterwarnings("ignore")
 
 
 # -----------------------------
-# CONFIG PAGE
+# Page config
 # -----------------------------
 st.set_page_config(
-    page_title="📈 Analyse de Séries Temporelles",
+    page_title="Analyse de Séries Temporelles",
     page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# -----------------------------
-# CSS
-# -----------------------------
-st.markdown("""
-<style>
-[data-testid="stMetricValue"] { font-size: 24px; color: #1E88E5 !important; font-weight: bold; }
-.stAlert { border-radius: 10px; }
-h1, h2, h3 { color: #0D47A1; }
-.stButton>button { width: 100%; border-radius: 6px; background-color: #1E88E5; color: white; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# -----------------------------
-# SESSION STATE INIT
-# -----------------------------
-if "raw_df" not in st.session_state:
-    st.session_state.raw_df = None
-if "ts" not in st.session_state:
-    st.session_state.ts = None
-if "date_col" not in st.session_state:
-    st.session_state.date_col = None
-if "val_col" not in st.session_state:
-    st.session_state.val_col = None
-if "freq" not in st.session_state:
-    st.session_state.freq = "D"
-if "period" not in st.session_state:
-    st.session_state.period = 12
-
-if "ts_final" not in st.session_state:
-    st.session_state.ts_final = None
-if "diff_d" not in st.session_state:
-    st.session_state.diff_d = 0
-if "diff_D" not in st.session_state:
-    st.session_state.diff_D = 0
-
-if "model_type" not in st.session_state:
-    st.session_state.model_type = "ARIMA"
-if "model_result" not in st.session_state:
-    st.session_state.model_result = None
-if "train" not in st.session_state:
-    st.session_state.train = None
-if "test" not in st.session_state:
-    st.session_state.test = None
-if "test_pred" not in st.session_state:
-    st.session_state.test_pred = None
-if "test_conf_int" not in st.session_state:
-    st.session_state.test_conf_int = None
-
-
-# -----------------------------
-# UTILS
-# -----------------------------
-def load_data(file, sep=","):
-    if file.name.endswith(".csv"):
-        return pd.read_csv(file, sep=sep)
-    if file.name.endswith((".xls", ".xlsx")):
-        return pd.read_excel(file)
-    raise ValueError("Format non supporté (CSV / Excel)")
-
-def to_numeric_series(s: pd.Series) -> pd.Series:
-    # gère "1,23" -> "1.23"
-    s = s.astype(str).str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
-
-def check_stationarity(series: pd.Series):
-    series = series.dropna()
-    adf_res = adfuller(series)
-    kpss_res = kpss(series, regression="c", nlags="auto")
-    return {
-        "adf_stat": adf_res[0],
-        "adf_p": adf_res[1],
-        "kpss_stat": kpss_res[0],
-        "kpss_p": kpss_res[1]
-    }
-
-def calculate_metrics(y_true, y_pred):
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mape = mean_absolute_percentage_error(y_true, y_pred)
-    return mae, rmse, mape
-
-def plot_ts_plotly(ts: pd.Series, title: str):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ts.index, y=ts.values, mode="lines", name="Série"))
-    fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Valeur",
-        hovermode="x unified",
-        height=420
-    )
-    fig.update_yaxes(autorange=True, fixedrange=False)
-    return fig
-
-def safe_lags(ts_len: int, desired: int) -> int:
-    # lags ne doit pas dépasser len(ts)-1
-    return max(1, min(desired, ts_len - 1))
-
-
-# -----------------------------
-# SIDEBAR WORKFLOW
-# -----------------------------
-st.sidebar.title("📊 Workflow d’Analyse")
-
-steps = [
-    "1. Préparation des Données",
-    "2. Visualisation & Décomposition",
-    "3. Stationnarité & Différenciation",
-    "4. Modélisation & Évaluation",
-    "5. Diagnostic des Résidus",
-    "6. Prévisions Futures"
-]
-progress_map = {s: (i + 1) / len(steps) for i, s in enumerate(steps)}
-step = st.sidebar.radio("Navigation", steps)
-st.sidebar.markdown(f"### 📍 Progression : **{int(progress_map[step]*100)}%**")
-st.sidebar.progress(progress_map[step])
-
-st.title("📈 Application d’Analyse de Séries Temporelles")
+st.title("📈 Application d'Analyse de Séries Temporelles")
+st.caption("Upload CSV/Excel • Visualisation • STL • ADF • ACF/PACF • ARIMA/SARIMA • Train/Test • Prévisions • Export CSV")
 st.markdown("---")
 
 
 # -----------------------------
-# 1) PREPARATION
+# Utils
 # -----------------------------
-if step == "1. Préparation des Données":
-    st.header("1️⃣ Préparation des Données")
-    st.info("Charger, nettoyer et structurer votre série temporelle.")
-
-    uploaded_file = st.file_uploader("Importer un fichier CSV ou Excel", type=["csv", "xlsx", "xls"])
-
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith(".csv"):
-                sep = st.radio("Séparateur CSV", [",", ";", "\t"], horizontal=True)
-                df = load_data(uploaded_file, sep=sep)
-            else:
-                df = load_data(uploaded_file)
-
-            st.session_state.raw_df = df
-
-            c1, c2 = st.columns([1.2, 1])
-            with c1:
-                st.subheader("Aperçu")
-                st.dataframe(df.head(10), use_container_width=True)
-                st.caption(f"{df.shape[0]} lignes × {df.shape[1]} colonnes")
-
-            with c2:
-                st.subheader("Configuration")
-                date_col = st.selectbox("Colonne Date", df.columns, index=0)
-                val_col = st.selectbox("Colonne Valeur", df.columns, index=min(1, len(df.columns)-1))
-
-                freq_label = st.selectbox(
-                    "Fréquence (resampling)",
-                    ["D (Journalier)", "W (Hebdomadaire)", "M (Mensuel)", "Q (Trimestriel)", "Y (Annuel)"]
-                )
-                freq = freq_label.split(" ")[0]
-
-                agg = st.selectbox("Agrégation (si plusieurs points dans la période)", ["mean", "sum", "median"])
-                fill_method = st.selectbox("Valeurs manquantes", ["interpolate", "ffill", "bfill", "drop"])
-
-                st.session_state.date_col = date_col
-                st.session_state.val_col = val_col
-                st.session_state.freq = freq
-
-            if st.button("✅ Valider la Série", type="primary"):
-                try:
-                    df = df.copy()
-                    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-                    df = df.dropna(subset=[date_col])
-
-                    df[val_col] = to_numeric_series(df[val_col])
-                    df = df.dropna(subset=[val_col])
-
-                    df = df.sort_values(date_col).set_index(date_col)
-
-                    # resample + aggregate
-                    if agg == "mean":
-                        ts = df[val_col].resample(freq).mean()
-                    elif agg == "sum":
-                        ts = df[val_col].resample(freq).sum()
-                    else:
-                        ts = df[val_col].resample(freq).median()
-
-                    # fill missing
-                    if fill_method == "interpolate":
-                        ts = ts.interpolate()
-                    elif fill_method == "ffill":
-                        ts = ts.ffill()
-                    elif fill_method == "bfill":
-                        ts = ts.bfill()
-                    else:
-                        ts = ts.dropna()
-
-                    st.session_state.ts = ts.dropna()
-                    st.session_state.ts_final = st.session_state.ts.copy()
-
-                    # reset model state on new data
-                    st.session_state.model_result = None
-                    st.session_state.train = None
-                    st.session_state.test = None
-                    st.session_state.test_pred = None
-                    st.session_state.test_conf_int = None
-
-                    st.success("✅ Série temporelle prête !")
-                    st.plotly_chart(plot_ts_plotly(st.session_state.ts, "Série temporelle (après préparation)"),
-                                    use_container_width=True)
-
-                except Exception as e:
-                    st.error(f"Erreur : {e}")
-
-    else:
-        st.info("👈 Importez un fichier pour commencer.")
-
-
-# -----------------------------
-# 2) EXPLORATION & DECOMPOSITION
-# -----------------------------
-elif step == "2. Visualisation & Décomposition":
-    st.header("2️⃣ Visualisation & Décomposition")
-
-    if st.session_state.ts is None:
-        st.warning("⚠️ Charge d’abord tes données à l’étape 1.")
-    else:
-        ts = st.session_state.ts
-
-        st.subheader("Série temporelle")
-        st.plotly_chart(plot_ts_plotly(ts, "Série temporelle originale"), use_container_width=True)
-
-        st.divider()
-        st.subheader("Décomposition")
-
-        colA, colB = st.columns([1, 2.5])
-        with colA:
-            period_options = {
-                "7 (hebdo)": 7,
-                "12 (mensuel)": 12,
-                "4 (trimestriel)": 4,
-                "52 (hebdo)": 52,
-                "365 (annuel)": 365
-            }
-            selected_period = st.selectbox("Période saisonnière", list(period_options.keys()), index=1)
-            period = period_options[selected_period]
-            st.session_state.period = period
-
-            method = st.selectbox("Méthode", ["STL (robuste)", "Additive", "Multiplicative"])
-        with colB:
+def load_data(file):
+    try:
+        name = file.name.lower()
+        if name.endswith(".csv"):
+            # tentative: séparateur auto + encodage commun
             try:
-                if method == "STL (robuste)":
-                    decomp = STL(ts, period=period, robust=True).fit()
-                    trend = decomp.trend
-                    seasonal = decomp.seasonal
-                    resid = decomp.resid
-                else:
-                    model = method.lower()
-                    decomp2 = seasonal_decompose(ts, model=model, period=period)
-                    trend = decomp2.trend
-                    seasonal = decomp2.seasonal
-                    resid = decomp2.resid
+                df = pd.read_csv(file)
+            except Exception:
+                file.seek(0)
+                df = pd.read_csv(file, sep=";")
+        elif name.endswith((".xls", ".xlsx")):
+            df = pd.read_excel(file)
+        else:
+            st.error("Format non supporté. Utilisez CSV ou Excel.")
+            return None
+        return df
+    except Exception as e:
+        st.error(f"Erreur lors du chargement : {e}")
+        return None
 
-                fig, axs = plt.subplots(4, 1, figsize=(12, 9), sharex=True)
-                ts.plot(ax=axs[0], title="Original")
-                trend.plot(ax=axs[1], title="Tendance")
-                seasonal.plot(ax=axs[2], title="Saisonnalité")
-                resid.plot(ax=axs[3], title="Résidus", style=".")
-                plt.tight_layout()
-                st.pyplot(fig)
-            except Exception as e:
-                st.error(f"Erreur décomposition : {e}")
+
+def coerce_numeric(s: pd.Series) -> pd.Series:
+    """Convertit en numérique en gérant virgules décimales + espaces."""
+    if pd.api.types.is_numeric_dtype(s):
+        return s
+    s2 = s.astype(str).str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(s2, errors="coerce")
+
+
+def adf_test(series: pd.Series):
+    series = series.dropna()
+    if len(series) < 10 or series.nunique() < 3:
+        return None
+    res = adfuller(series)
+    return {
+        "ADF Statistic": res[0],
+        "p-value": res[1],
+        "Critical Values": res[4],
+        "stationnaire": res[1] < 0.05
+    }
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def safe_infer_freq(idx: pd.DatetimeIndex):
+    try:
+        return pd.infer_freq(idx)
+    except Exception:
+        return None
+
+
+def make_forecast_index(last_date, steps: int, freq: str):
+    # start = last_date; periods = steps+1 then drop first to avoid repeating last point
+    return pd.date_range(start=last_date, periods=steps + 1, freq=freq)[1:]
+
+
+def plot_series_plotly(x, y, name, dash=None):
+    return go.Scatter(
+        x=x, y=y, mode="lines", name=name,
+        line=dict(width=2, dash=dash if dash else "solid")
+    )
 
 
 # -----------------------------
-# 3) STATIONARITE & DIFFERENCIATION
+# Session state
 # -----------------------------
-elif step == "3. Stationnarité & Différenciation":
-    st.header("3️⃣ Stationnarité & Différenciation")
+for k in ["data", "prepared_df", "model_fitted", "forecast_future", "forecast_future_index",
+          "train", "test", "pred_test", "metrics", "stl_df", "validation_df", "summary_df"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
-    if st.session_state.ts is None:
-        st.warning("⚠️ Charge d’abord tes données à l’étape 1.")
-    else:
-        ts = st.session_state.ts
 
-        st.subheader("Tests stationnarité (série originale)")
-        res0 = check_stationarity(ts)
+# -----------------------------
+# Sidebar - Upload
+# -----------------------------
+st.sidebar.header("1️⃣ Chargement des Données")
+uploaded_file = st.sidebar.file_uploader(
+    "Téléchargez votre fichier (CSV ou Excel)",
+    type=["csv", "xlsx", "xls"]
+)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("ADF p-value", f"{res0['adf_p']:.4f}")
-            st.write("✅ Stationnaire (ADF)" if res0["adf_p"] < 0.05 else "❌ Non-stationnaire (ADF)")
-        with c2:
-            st.metric("KPSS p-value", f"{res0['kpss_p']:.4f}")
-            st.write("✅ Stationnaire (KPSS)" if res0["kpss_p"] > 0.05 else "❌ Non-stationnaire (KPSS)")
+if uploaded_file is not None:
+    st.session_state.data = load_data(uploaded_file)
 
-        st.divider()
+if st.session_state.data is None:
+    st.info("👆 Veuillez télécharger un fichier CSV ou Excel pour commencer.")
+    st.markdown("""
+## 📝 Instructions
+1. Téléchargez un CSV/Excel contenant une **colonne Date** et une **colonne Valeur**.  
+2. Sélectionnez les colonnes, vérifiez la série, lancez STL/ADF, puis ARIMA/SARIMA.  
+3. Optionnel : activez Train/Test, ACF/PACF, export CSV.  
+""")
+    st.markdown("---")
+    st.markdown("**Application d'Analyse de Séries Temporelles** | Streamlit")
+    st.stop()
 
-        st.subheader("Différenciation")
-        modele_choisi = st.radio("Préparation pour", ["ARIMA", "SARIMA"], horizontal=True)
-        d = st.slider("Ordre différenciation (d)", 0, 2, st.session_state.diff_d)
-        D = 0
-        if modele_choisi == "SARIMA":
-            D = st.slider("Différenciation saisonnière (D)", 0, 2, st.session_state.diff_D)
+df_raw = st.session_state.data.copy()
+st.sidebar.success("✅ Données chargées!")
 
-        ts_final = ts.copy()
-        if d > 0:
-            for _ in range(d):
-                ts_final = ts_final.diff().dropna()
-        if D > 0:
-            ts_final = ts_final.diff(st.session_state.period).dropna()
 
-        st.session_state.ts_final = ts_final
-        st.session_state.diff_d = d
-        st.session_state.diff_D = D
+# -----------------------------
+# Preview
+# -----------------------------
+with st.expander("📊 Aperçu des données", expanded=True):
+    st.dataframe(df_raw.head(10), use_container_width=True)
+    st.write(f"**Dimensions:** {df_raw.shape[0]} lignes × {df_raw.shape[1]} colonnes")
 
-        if d > 0 or D > 0:
-            res1 = check_stationarity(ts_final)
-            st.write(f"**Après différenciation (d={d}, D={D})**")
-            r1, r2 = st.columns(2)
-            r1.write(f"ADF p-value : **{res1['adf_p']:.4f}**")
-            r2.write(f"KPSS p-value : **{res1['kpss_p']:.4f}**")
 
-            if res1["adf_p"] < 0.05 and res1["kpss_p"] > 0.05:
-                st.success("✅ Série beaucoup plus stationnaire (bon signe).")
+# -----------------------------
+# Column selection & preparation
+# -----------------------------
+st.sidebar.header("2️⃣ Configuration")
+date_col = st.sidebar.selectbox("Colonne de dates", options=df_raw.columns.tolist())
+
+value_col = st.sidebar.selectbox(
+    "Colonne de valeurs",
+    options=[c for c in df_raw.columns.tolist() if c != date_col]
+)
+
+# Prepare data
+try:
+    df = df_raw[[date_col, value_col]].copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[value_col] = coerce_numeric(df[value_col])
+    df = df.dropna(subset=[date_col, value_col]).sort_values(date_col)
+    df = df.set_index(date_col)
+
+    # Remove duplicate dates by aggregating (mean) to avoid index issues
+    if df.index.duplicated().any():
+        df = df.groupby(df.index).mean(numeric_only=True)
+
+    st.session_state.prepared_df = df
+
+except Exception as e:
+    st.error(f"Erreur lors de la préparation : {e}")
+    st.info("Vérifiez que la colonne date est correcte et que la colonne valeur est numérique.")
+    st.stop()
+
+df = st.session_state.prepared_df
+
+if len(df) < 10:
+    st.warning("Série très courte : certaines analyses (ADF/ARIMA/STL) peuvent être instables.")
+
+if df[value_col].nunique() < 5:
+    st.warning("Série peu variable : les résultats peuvent être peu fiables.")
+
+
+# -----------------------------
+# Frequency (robust for online)
+# -----------------------------
+st.sidebar.header("3️⃣ Fréquence")
+inferred = safe_infer_freq(df.index)
+freq_choice = st.sidebar.selectbox(
+    "Fréquence de la série",
+    options=["Auto", "D", "W", "M", "MS", "H"],
+    help="Auto tente de détecter; sinon choisis une fréquence."
+)
+freq = inferred if (freq_choice == "Auto" and inferred is not None) else ("D" if freq_choice == "Auto" else freq_choice)
+
+if inferred is None and freq_choice == "Auto":
+    st.sidebar.warning("Auto n'a pas trouvé la fréquence → fallback sur D (jour).")
+
+
+# -----------------------------
+# Visualization
+# -----------------------------
+st.header("📈 Visualisation de la Série Temporelle")
+
+fig = go.Figure()
+fig.add_trace(plot_series_plotly(df.index, df[value_col], "Série temporelle"))
+fig.update_layout(
+    title=f"Série Temporelle : {value_col}",
+    xaxis_title="Date",
+    yaxis_title=value_col,
+    hovermode="x unified",
+    height=420
+)
+st.plotly_chart(fig, use_container_width=True)
+
+
+# -----------------------------
+# STL
+# -----------------------------
+st.header("🔍 Décomposition STL")
+
+c1, c2 = st.columns([1, 3])
+with c1:
+    period = st.number_input(
+        "Période de saisonnalité (STL)",
+        min_value=2,
+        max_value=365,
+        value=12,
+        help="Nombre d'observations dans un cycle saisonnier."
+    )
+
+if st.button("🔄 Calculer la décomposition STL"):
+    with st.spinner("Calcul STL..."):
+        try:
+            stl = STL(df[value_col], period=int(period))
+            res = stl.fit()
+
+            fig_stl, axes = plt.subplots(4, 1, figsize=(12, 10))
+            axes[0].plot(df.index, df[value_col])
+            axes[0].set_title("Décomposition STL")
+            axes[0].set_ylabel("Original")
+            axes[0].grid(True, alpha=0.3)
+
+            axes[1].plot(res.trend.index, res.trend)
+            axes[1].set_ylabel("Tendance")
+            axes[1].grid(True, alpha=0.3)
+
+            axes[2].plot(res.seasonal.index, res.seasonal)
+            axes[2].set_ylabel("Saisonnalité")
+            axes[2].grid(True, alpha=0.3)
+
+            axes[3].plot(res.resid.index, res.resid)
+            axes[3].set_ylabel("Résidus")
+            axes[3].set_xlabel("Date")
+            axes[3].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            st.pyplot(fig_stl)
+
+            stl_df = pd.DataFrame({
+                "Date": df.index,
+                "observed": df[value_col].values,
+                "trend": res.trend.values,
+                "seasonal": res.seasonal.values,
+                "resid": res.resid.values
+            })
+            st.session_state.stl_df = stl_df
+
+            st.download_button(
+                "⬇️ Télécharger la décomposition STL (CSV)",
+                data=to_csv_bytes(stl_df),
+                file_name="stl_decomposition.csv",
+                mime="text/csv"
+            )
+        except Exception as e:
+            st.error(f"Erreur STL : {e}")
+
+
+# -----------------------------
+# ADF
+# -----------------------------
+st.header("📊 Test de Stationnarité (ADF)")
+
+if st.button("🧪 Effectuer le test ADF"):
+    with st.spinner("Calcul ADF..."):
+        adf_res = adf_test(df[value_col])
+        if adf_res is None:
+            st.warning("ADF impossible (série trop courte ou trop peu variable).")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Statistique ADF", f"{adf_res['ADF Statistic']:.4f}")
+            c2.metric("p-value", f"{adf_res['p-value']:.4f}")
+            if adf_res["stationnaire"]:
+                c3.success("✅ Stationnaire")
             else:
-                st.warning("⚠️ Pas encore idéale. Tu peux ajuster d/D ou envisager une transformation (log, etc.).")
+                c3.warning("⚠️ Non stationnaire")
 
-        st.divider()
+            st.write("**Valeurs critiques**")
+            for k, v in adf_res["Critical Values"].items():
+                st.write(f"- {k}: {v:.4f}")
 
-        st.subheader("ACF & PACF (sur la série finale)")
-        lags_desired = st.session_state.period * 5
-        lags = safe_lags(len(st.session_state.ts_final), lags_desired)
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        plot_acf(st.session_state.ts_final, lags=lags, ax=ax1)
-        plot_pacf(st.session_state.ts_final, lags=lags, ax=ax2, method="ywm")
-        plt.tight_layout()
-        st.pyplot(fig)
+            if adf_res["stationnaire"]:
+                st.info("Interprétation : p-value < 0.05 → série stationnaire.")
+            else:
+                st.info("Interprétation : p-value ≥ 0.05 → série non stationnaire (différenciation souvent utile).")
 
 
 # -----------------------------
-# 4) MODELISATION & EVALUATION
+# ACF / PACF
 # -----------------------------
-elif step == "4. Modélisation & Évaluation":
-    st.header("4️⃣ Modélisation & Évaluation")
+st.header("📌 ACF / PACF (pour aider au choix de p et q)")
 
-    if st.session_state.ts is None:
-        st.warning("⚠️ Charge d’abord tes données à l’étape 1.")
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    use_diff = st.checkbox("Afficher sur série différenciée (d=1)", value=False)
+with colB:
+    nlags = st.slider("Nombre de lags", 10, 60, 30)
+
+if st.button("📉 Afficher ACF/PACF"):
+    series_for_corr = df[value_col].dropna()
+    if use_diff:
+        series_for_corr = series_for_corr.diff().dropna()
+
+    if len(series_for_corr) < 20:
+        st.warning("Série trop courte pour ACF/PACF.")
     else:
-        ts = st.session_state.ts
+        fig1, ax1 = plt.subplots(figsize=(10, 4))
+        plot_acf(series_for_corr, lags=int(nlags), ax=ax1)
+        ax1.set_title("ACF")
+        st.pyplot(fig1)
 
-        st.subheader("Split train / test")
-        test_size = st.slider("Taille du test (%)", 5, 30, 20) / 100
-        split_idx = int(len(ts) * (1 - test_size))
-        train, test = ts.iloc[:split_idx], ts.iloc[split_idx:]
-
-        st.session_state.train = train
-        st.session_state.test = test
-
-        cA, cB = st.columns([1, 1])
-        with cA:
-            st.caption("Train")
-            st.plotly_chart(plot_ts_plotly(train, "Train"), use_container_width=True)
-        with cB:
-            st.caption("Test")
-            st.plotly_chart(plot_ts_plotly(test, "Test"), use_container_width=True)
-
-        st.divider()
-        st.subheader("Choix du modèle")
-
-        model_type = st.selectbox("Modèle", ["ARIMA", "SARIMA"])
-        st.session_state.model_type = model_type
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Paramètres non-saisonniers (p, d, q)**")
-            p = st.number_input("p", 0, 10, 1)
-            d_val = st.number_input("d", 0, 2, 1)
-            q = st.number_input("q", 0, 10, 1)
-
-        if model_type == "SARIMA":
-            with col2:
-                st.write("**Paramètres saisonniers (P, D, Q, s)**")
-                P = st.number_input("P", 0, 10, 0)
-                D_val = st.number_input("D", 0, 2, 0)
-                Q = st.number_input("Q", 0, 10, 0)
-                s = st.number_input("s (période)", value=int(st.session_state.period), min_value=2, max_value=365)
-
-        if st.button(f"🚀 Entraîner {model_type}", type="primary"):
-            with st.spinner("Entraînement du modèle..."):
-                try:
-                    if model_type == "ARIMA":
-                        model = ARIMA(train, order=(p, d_val, q))
-                        result = model.fit()
-                    else:
-                        model = SARIMAX(train, order=(p, d_val, q), seasonal_order=(P, D_val, Q, s))
-                        result = model.fit(disp=False)
-
-                    # IMPORTANT: on sauvegarde le modèle fitted pour étapes 5/6
-                    st.session_state.model_result = result
-
-                    # forecast sur la taille du test
-                    fc = result.get_forecast(steps=len(test))
-                    preds = fc.predicted_mean
-                    conf_int = fc.conf_int()
-
-                    st.session_state.test_pred = preds
-                    st.session_state.test_conf_int = conf_int
-
-                    mae, rmse, mape = calculate_metrics(test, preds)
-
-                    st.subheader("Résultats")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("MAE", f"{mae:.3f}")
-                    m2.metric("RMSE", f"{rmse:.3f}")
-                    m3.metric("MAPE", f"{mape:.2%}")
-
-                    with st.expander("📋 Résumé du modèle"):
-                        st.text(result.summary())
-
-                    # plot
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=train.index, y=train, name="Train"))
-                    fig.add_trace(go.Scatter(x=test.index, y=test, name="Test"))
-                    fig.add_trace(go.Scatter(x=test.index, y=preds, name="Prédictions", line=dict(dash="dash")))
-
-                    # IC
-                    fig.add_trace(go.Scatter(
-                        x=test.index, y=conf_int.iloc[:, 0],
-                        line_color="rgba(0,0,0,0)", showlegend=False
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=test.index, y=conf_int.iloc[:, 1],
-                        fill="tonexty", fillcolor="rgba(30,136,229,0.15)",
-                        line_color="rgba(0,0,0,0)", name="IC"
-                    ))
-                    fig.update_layout(
-                        title="Train/Test + Prédictions (avec IC)",
-                        hovermode="x unified",
-                        height=520
-                    )
-                    fig.update_yaxes(autorange=True, fixedrange=False)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                except Exception as e:
-                    st.error(f"❌ Erreur entraînement : {e}")
+        fig2, ax2 = plt.subplots(figsize=(10, 4))
+        plot_pacf(series_for_corr, lags=int(nlags), ax=ax2, method="ywm")
+        ax2.set_title("PACF")
+        st.pyplot(fig2)
 
 
 # -----------------------------
-# 5) DIAGNOSTIC RESIDUS
+# Modeling + Train/Test + Future Forecast
 # -----------------------------
-elif step == "5. Diagnostic des Résidus":
-    st.header("5️⃣ Diagnostic des Résidus")
+st.header("🤖 Modélisation, Validation et Prédiction")
 
-    if st.session_state.model_result is None:
-        st.warning("⚠️ Ajuste un modèle à l’étape 4 avant.")
+st.subheader("🧩 Découpage Train/Test (optionnel mais recommandé)")
+enable_split = st.checkbox("Activer la validation Train/Test", value=True)
+
+train = df[value_col]
+test = None
+
+if enable_split:
+    split_mode = st.radio(
+        "Méthode de split",
+        ["Pourcentage", "Nombre de points (test)"],
+        horizontal=True
+    )
+
+    if split_mode == "Pourcentage":
+        train_ratio = st.slider("Part du train (%)", 50, 95, 80)
+        split_idx = int(len(df) * train_ratio / 100)
     else:
-        result = st.session_state.model_result
-        resid = result.resid.dropna()
+        test_size = st.number_input(
+            "Taille du test (nombre de points)",
+            min_value=5,
+            max_value=max(5, min(365, len(df) - 5)),
+            value=min(30, max(5, len(df) - 5))
+        )
+        split_idx = len(df) - int(test_size)
 
-        st.subheader("Tests")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            lb = acorr_ljungbox(resid, lags=[10], return_df=True)
-            lb_p = float(lb["lb_pvalue"].iloc[0])
-            st.metric("Ljung-Box p-value", f"{lb_p:.4f}")
-            st.write("✅ Bruit blanc" if lb_p > 0.05 else "❌ Autocorrélation détectée")
-
-        with c2:
-            adf_p_resid = float(adfuller(resid)[1])
-            st.metric("ADF p-value (résidus)", f"{adf_p_resid:.4f}")
-            st.write("✅ Résidus stationnaires" if adf_p_resid < 0.05 else "❌ Résidus non stationnaires")
-
-        st.divider()
-        st.subheader("Graphiques")
-
-        fig, axs = plt.subplots(2, 2, figsize=(12, 9))
-
-        # 1) Residus
-        axs[0, 0].plot(resid.values)
-        axs[0, 0].axhline(0, color="black", linestyle="--", alpha=0.6)
-        axs[0, 0].set_title("Résidus")
-        axs[0, 0].grid(True, alpha=0.2)
-
-        # 2) Hist + normale
-        axs[0, 1].hist(resid.values, bins=30, density=True, alpha=0.7)
-        x_axis = np.linspace(resid.min(), resid.max(), 200)
-        axs[0, 1].plot(x_axis, norm.pdf(x_axis, np.mean(resid), np.std(resid)))
-        axs[0, 1].set_title("Distribution (hist + normale)")
-        axs[0, 1].grid(True, alpha=0.2)
-
-        # 3) QQ plot
-        qqplot(resid, line="s", ax=axs[1, 0])
-        axs[1, 0].set_title("Q-Q plot")
-
-        # 4) ACF residus
-        lags = safe_lags(len(resid), 20)
-        plot_acf(resid, lags=lags, ax=axs[1, 1])
-        axs[1, 1].set_title("ACF résidus")
-
-        plt.tight_layout()
-        st.pyplot(fig)
+    train = df[value_col].iloc[:split_idx]
+    test = df[value_col].iloc[split_idx:]
+    st.caption(f"Train: {len(train)} points | Test: {len(test)} points")
 
 
-# -----------------------------
-# 6) FORECAST FUTUR
-# -----------------------------
-elif step == "6. Prévisions Futures":
-    st.header("6️⃣ Prévisions Futures")
+st.subheader("⚙️ Choix du modèle et paramètres")
+col1, col2 = st.columns(2)
+with col1:
+    model_type = st.selectbox("Modèle", ["ARIMA", "SARIMA"])
+with col2:
+    horizon_future = st.number_input(
+        "Horizon de prédiction future",
+        min_value=1, max_value=365, value=30,
+        help="Nombre de pas dans le futur pour la prédiction finale."
+    )
 
-    if st.session_state.model_result is None or st.session_state.ts is None:
-        st.warning("⚠️ Ajuste un modèle à l’étape 4 avant.")
+if model_type == "ARIMA":
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        p = st.number_input("p (AR)", 0, 10, 1)
+    with c2:
+        d = st.number_input("d (diff)", 0, 2, 1)
+    with c3:
+        q = st.number_input("q (MA)", 0, 10, 1)
+
+    # placeholders SARIMA
+    P = D = Q = s = None
+
+else:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        p = st.number_input("p (AR)", 0, 10, 1)
+    with c2:
+        d = st.number_input("d (diff)", 0, 2, 1)
+    with c3:
+        q = st.number_input("q (MA)", 0, 10, 1)
+    with c4:
+        s = st.number_input("s (période saisonnière)", 2, 365, 12)
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        P = st.number_input("P (AR saisonnier)", 0, 10, 1)
+    with c6:
+        D = st.number_input("D (diff saisonnière)", 0, 2, 1)
+    with c7:
+        Q = st.number_input("Q (MA saisonnier)", 0, 10, 1)
+
+
+def fit_model(series_train: pd.Series):
+    if model_type == "ARIMA":
+        model = ARIMA(series_train, order=(int(p), int(d), int(q)))
+        fitted = model.fit()
     else:
-        result = st.session_state.model_result
-        ts = st.session_state.ts
+        model = SARIMAX(
+            series_train,
+            order=(int(p), int(d), int(q)),
+            seasonal_order=(int(P), int(D), int(Q), int(s))
+        )
+        fitted = model.fit(disp=False)
+    return fitted
 
-        horizon = st.number_input("Horizon de prévision", min_value=1, max_value=365, value=24)
 
-        if st.button("🔮 Générer les prévisions", type="primary"):
-            with st.spinner("Prévision en cours..."):
-                try:
-                    fc = result.get_forecast(steps=horizon)
-                    y_pred = fc.predicted_mean
-                    conf_int = fc.conf_int()
+if st.button("🚀 Entraîner / Valider / Prédire", type="primary"):
+    with st.spinner("Entraînement en cours..."):
+        try:
+            # 1) Fit on train
+            fitted_train = fit_model(train)
+            st.session_state.model_fitted = fitted_train
 
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(x=ts.index, y=ts.values, name="Historique"))
+            # 2) Predict on test (validation)
+            metrics = None
+            validation_df = None
+            pred_test = None
 
-                    fig.add_trace(go.Scatter(
-                        x=y_pred.index, y=y_pred.values,
-                        name="Prévision", line=dict(dash="dash")
-                    ))
+            if enable_split and test is not None and len(test) > 0:
+                pred_test = fitted_train.forecast(steps=len(test))
+                st.session_state.pred_test = pred_test
 
-                    fig.add_trace(go.Scatter(
-                        x=y_pred.index, y=conf_int.iloc[:, 0],
-                        line_color="rgba(0,0,0,0)", showlegend=False
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=y_pred.index, y=conf_int.iloc[:, 1],
-                        fill="tonexty", fillcolor="rgba(30,136,229,0.15)",
-                        line_color="rgba(0,0,0,0)", name="IC"
-                    ))
+                mae = mean_absolute_error(test, pred_test)
+                rmse = mean_squared_error(test, pred_test, squared=False)
+                # MAPE safe
+                denom = test.replace(0, np.nan)
+                mape = (np.abs((test - pred_test) / denom)).mean() * 100
 
-                    fig.update_layout(
-                        title="Prévisions futures (avec intervalle de confiance)",
-                        hovermode="x unified",
-                        height=540
-                    )
-                    fig.update_yaxes(autorange=True, fixedrange=False)
+                metrics = {"MAE": float(mae), "RMSE": float(rmse), "MAPE_percent": float(mape)}
+                st.session_state.metrics = metrics
 
-                    st.plotly_chart(fig, use_container_width=True)
+                validation_df = pd.DataFrame({
+                    "Date": test.index,
+                    "y_true": test.values,
+                    "y_pred": pred_test.values if hasattr(pred_test, "values") else np.array(pred_test)
+                })
+                st.session_state.validation_df = validation_df
 
-                    out = pd.DataFrame({
-                        "date": y_pred.index,
-                        "forecast": y_pred.values,
-                        "ci_low": conf_int.iloc[:, 0].values,
-                        "ci_high": conf_int.iloc[:, 1].values
-                    })
+            # 3) Fit on full series for final future forecast
+            fitted_full = fit_model(df[value_col])
+            # use get_forecast for possible conf_int
+            pred_res = fitted_full.get_forecast(steps=int(horizon_future))
+            forecast_future = pred_res.predicted_mean
+            conf_int = pred_res.conf_int()
 
-                    st.dataframe(out, use_container_width=True)
-                    st.download_button(
-                        "📥 Télécharger CSV",
-                        data=out.to_csv(index=False).encode("utf-8"),
-                        file_name="forecast.csv",
-                        mime="text/csv"
-                    )
+            future_index = make_forecast_index(df.index[-1], int(horizon_future), freq=freq)
 
-                except Exception as e:
-                    st.error(f"❌ Erreur prévision : {e}")
+            st.session_state.forecast_future = forecast_future
+            st.session_state.forecast_future_index = future_index
+
+            # 4) summary df export
+            summary_df = pd.DataFrame([{
+                "model_type": model_type,
+                "p": int(p), "d": int(d), "q": int(q),
+                "P": int(P) if model_type == "SARIMA" else np.nan,
+                "D": int(D) if model_type == "SARIMA" else np.nan,
+                "Q": int(Q) if model_type == "SARIMA" else np.nan,
+                "s": int(s) if model_type == "SARIMA" else np.nan,
+                "freq_used": freq,
+                "train_test_enabled": bool(enable_split),
+                "MAE": metrics["MAE"] if metrics else np.nan,
+                "RMSE": metrics["RMSE"] if metrics else np.nan,
+                "MAPE_percent": metrics["MAPE_percent"] if metrics else np.nan
+            }])
+            st.session_state.summary_df = summary_df
+
+            st.success("✅ Entraînement terminé (validation + prédiction future générées).")
+
+            with st.expander("📋 Résumé du modèle (fit sur train)"):
+                st.text(fitted_train.summary())
+
+            # store conf_int in session for plotting/export
+            st.session_state["conf_int_future"] = remember_conf = conf_int.copy()
+
+        except Exception as e:
+            st.error(f"❌ Erreur entraînement/prédiction : {e}")
+
+
+# -----------------------------
+# Results display
+# -----------------------------
+if st.session_state.model_fitted is not None and st.session_state.forecast_future is not None:
+    st.markdown("---")
+    st.header("📊 Résultats")
+
+    # Metrics
+    if enable_split and st.session_state.metrics is not None:
+        st.subheader("✅ Validation Train/Test")
+        m = st.session_state.metrics
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MAE", f"{m['MAE']:.3f}")
+        c2.metric("RMSE", f"{m['RMSE']:.3f}")
+        c3.metric("MAPE (%)", f"{m['MAPE_percent']:.2f}")
+
+        # Plot validation
+        train_series = train
+        test_series = test
+        pred_test = st.session_state.pred_test
+
+        fig_val = go.Figure()
+        fig_val.add_trace(plot_series_plotly(train_series.index, train_series, "Train"))
+        fig_val.add_trace(plot_series_plotly(test_series.index, test_series, "Test (vrai)"))
+        fig_val.add_trace(plot_series_plotly(test_series.index, pred_test, "Prévision sur test", dash="dash"))
+        fig_val.update_layout(title="Validation temporelle (Train/Test)", hovermode="x unified", height=450)
+        st.plotly_chart(fig_val, use_container_width=True)
+
+        # Export validation CSV
+        validation_df = st.session_state.validation_df
+        if validation_df is not None:
+            st.download_button(
+                "⬇️ Télécharger validation (test vs prédiction) (CSV)",
+                data=to_csv_bytes(validation_df),
+                file_name="validation_test_predictions.csv",
+                mime="text/csv"
+            )
+
+    # Future forecast plot
+    st.subheader("📈 Prédiction Future")
+    future_index = st.session_state.forecast_future_index
+    forecast_future = st.session_state.forecast_future
+    conf_int = st.session_state.get("conf_int_future", None)
+
+    fig_f = go.Figure()
+    fig_f.add_trace(plot_series_plotly(df.index, df[value_col], "Historique"))
+    fig_f.add_trace(plot_series_plotly(future_index, forecast_future, "Prévision future", dash="dash"))
+
+    # Optional conf int
+    if conf_int is not None and isinstance(conf_int, pd.DataFrame) and conf_int.shape[1] >= 2:
+        lower = conf_int.iloc[:, 0].values
+        upper = conf_int.iloc[:, 1].values
+        fig_f.add_trace(go.Scatter(x=future_index, y=lower, mode="lines", name="Borne basse", line=dict(dash="dot"), opacity=0.5))
+        fig_f.add_trace(go.Scatter(x=future_index, y=upper, mode="lines", name="Borne haute", line=dict(dash="dot"), opacity=0.5))
+
+    fig_f.update_layout(title="Historique + Prévision Future", hovermode="x unified", height=520)
+    st.plotly_chart(fig_f, use_container_width=True)
+
+    # Zoom recent
+    st.subheader("🔎 Zoom sur la période récente (historique + future)")
+    recent_period = st.slider(
+        "Nombre de points historiques à afficher",
+        min_value=10,
+        max_value=len(df),
+        value=min(60, len(df))
+    )
+
+    recent_data = df[value_col].tail(int(recent_period))
+    fig_zoom = go.Figure()
+    fig_zoom.add_trace(go.Scatter(x=recent_data.index, y=recent_data, mode="lines+markers", name="Observations"))
+    fig_zoom.add_trace(go.Scatter(x=future_index, y=forecast_future, mode="lines+markers", name="Prévision future", line=dict(dash="dash")))
+    fig_zoom.update_layout(title="Zoom : Observations récentes vs Prévision", hovermode="x unified", height=420)
+    st.plotly_chart(fig_zoom, use_container_width=True)
+
+    # Forecast table + export
+    with st.expander("📋 Valeurs prédites (future)"):
+        forecast_df = pd.DataFrame({
+            "Date": future_index,
+            "Prediction": forecast_future.values if hasattr(forecast_future, "values") else np.array(forecast_future)
+        })
+        st.dataframe(forecast_df, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Télécharger les prédictions futures (CSV)",
+            data=to_csv_bytes(forecast_df),
+            file_name="predictions_forecast_future.csv",
+            mime="text/csv"
+        )
+
+    # Export summary
+    with st.expander("📤 Export global (résumé params + métriques)"):
+        summary_df = st.session_state.summary_df
+        if summary_df is not None:
+            st.dataframe(summary_df, use_container_width=True)
+            st.download_button(
+                "⬇️ Télécharger le résumé (CSV)",
+                data=to_csv_bytes(summary_df),
+                file_name="model_summary_metrics.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("Le résumé sera disponible après un entraînement.")
+
+
+st.markdown("---")
+st.markdown("**Application d'Analyse de Séries Temporelles** | Projet Streamlit 2024-2025")
