@@ -446,7 +446,8 @@ if st.button("🚀 Entraîner / Valider / Prédire", type="primary"):
                 st.session_state.pred_test = pred_test
 
                 mae = mean_absolute_error(test, pred_test)
-                rmse = mean_squared_error(test, pred_test, squared=False)
+                rmse = np.sqrt(mean_squared_error(test, pred_test))
+
                 # MAPE safe
                 denom = test.replace(0, np.nan)
                 mape = (np.abs((test - pred_test) / denom)).mean() * 100
